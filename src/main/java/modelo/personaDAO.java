@@ -11,11 +11,6 @@ import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.List;
-import java.awt.event.MouseAdapter;
-import java.awt.event.MouseEvent;
-import javax.swing.JPopupMenu;
-import javax.swing.JMenuItem;
-import javax.swing.JTable;
 
 public class personaDAO {
 
@@ -58,7 +53,7 @@ public class personaDAO {
     }
 
     // Agregar un contacto al archivo
-    public boolean escribirArchivo(persona contacto)
+    public synchronized boolean escribirArchivo(persona contacto)
             throws IOException {
 
         validarContacto(contacto);
@@ -76,8 +71,37 @@ public class personaDAO {
         return true;
     }
 
+    // Validar duplicados antes de guardar
+    public synchronized boolean guardarSiNoExiste(persona nuevo)
+            throws IOException {
+
+        validarContacto(nuevo);
+
+        // Obtener contactos registrados
+        List<persona> registrados = leerArchivo();
+
+        // Comprobar si ya existe
+        for (persona existente : registrados) {
+
+            boolean mismoTelefono = existente.getTelefono().trim()
+                    .equals(nuevo.getTelefono().trim());
+
+            boolean mismoEmail = existente.getEmail().trim()
+                    .equalsIgnoreCase(nuevo.getEmail().trim());
+
+            if (mismoTelefono || mismoEmail) {
+                return false;
+            }
+        }
+
+        // Si no está duplicado, guardar
+        escribirArchivo(nuevo);
+
+        return true;
+    }
+
     // Leer todos los contactos registrados
-    public List<persona> leerArchivo() throws IOException {
+    public synchronized List<persona> leerArchivo() throws IOException {
 
         List<persona> personas = new ArrayList<>();
 
@@ -120,7 +144,7 @@ public class personaDAO {
     }
 
     // Actualizar todos los contactos del archivo
-    public void actualizarContactos(List<persona> personas)
+    public synchronized void actualizarContactos(List<persona> personas)
             throws IOException {
 
         Path temporal = Files.createTempFile(
@@ -160,6 +184,109 @@ public class personaDAO {
         }
     }
 
+    // MODIFICAR CONTACTO CON SINCRONIZACIÓN
+    public synchronized boolean modificarContactoSeguro(
+            int indice, persona original, persona nuevo)
+            throws IOException {
+
+        // Validar los datos nuevos
+        validarContacto(nuevo);
+
+        // Leer los contactos más recientes del archivo
+        List<persona> registrados = leerArchivo();
+
+        // Verificar que el índice sea válido
+        if (indice < 0 || indice >= registrados.size()) {
+            return false;
+        }
+
+        // Comprobar que el contacto no fue modificado
+        // por otro hilo mientras estaba seleccionado
+        persona actual = registrados.get(indice);
+
+        if (!mismoContacto(actual, original)) {
+            return false;
+        }
+
+        // Evitar duplicados con otros contactos
+        for (int i = 0; i < registrados.size(); i++) {
+
+            if (i == indice) {
+                continue;
+            }
+
+            persona existente = registrados.get(i);
+
+            boolean mismoTelefono = existente.getTelefono().trim()
+                    .equals(nuevo.getTelefono().trim());
+
+            boolean mismoEmail = existente.getEmail().trim()
+                    .equalsIgnoreCase(nuevo.getEmail().trim());
+
+            if (mismoTelefono || mismoEmail) {
+                throw new IOException(
+                        "El teléfono o correo ya pertenece a otro contacto.");
+            }
+        }
+
+        // Modificar el contacto
+        registrados.set(indice, nuevo);
+
+        // Guardar los datos actualizados
+        actualizarContactos(registrados);
+
+        System.out.println("Contacto modificado en: "
+                + Thread.currentThread().getName());
+
+        return true;
+    }
+
+    // COMPROBAR SI EL CONTACTO SIGUE SIENDO EL MISMO
+    private boolean mismoContacto(persona a, persona b) {
+
+        if (a == null || b == null) {
+            return false;
+        }
+
+        return java.util.Objects.equals(a.getNombre(), b.getNombre())
+                && java.util.Objects.equals(a.getTelefono(), b.getTelefono())
+                && java.util.Objects.equals(a.getEmail(), b.getEmail())
+                && java.util.Objects.equals(a.getCategoria(), b.getCategoria())
+                && a.isFavorito() == b.isFavorito();
+    }
+
+    // ELIMINAR CONTACTO CON SINCRONIZACIÓN
+    public synchronized boolean eliminarContactoSeguro(
+            int indice, persona original) throws IOException {
+
+        // Leer los contactos más recientes del archivo
+        List<persona> registrados = leerArchivo();
+
+        // Verificar que el índice sea válido
+        if (indice < 0 || indice >= registrados.size()) {
+            return false;
+        }
+
+        // Comprobar que el contacto no haya cambiado
+        persona actual = registrados.get(indice);
+
+        if (!mismoContacto(actual, original)) {
+            return false;
+        }
+
+        // Eliminar el contacto
+        registrados.remove(indice);
+
+        // Guardar la lista actualizada
+        actualizarContactos(registrados);
+
+        // Mostrar el hilo que realizó la eliminación
+        System.out.println("Contacto eliminado en: "
+                + Thread.currentThread().getName());
+
+        return true;
+    }
+
     // Validar datos antes de almacenarlos
     private void validarContacto(persona contacto)
             throws IOException {
@@ -189,10 +316,16 @@ public class personaDAO {
         }
     }
 
-    // EXPORTAR CONTACTOS A CSV
-    public void exportarCSV(File destino) throws IOException {
+// EXPORTAR CONTACTOS A CSV CON SINCRONIZACIÓN
+    public synchronized void exportarCSV(File destino)
+            throws IOException {
 
+        // Obtener los contactos registrados
         List<persona> personas = leerArchivo();
+
+        // Mostrar el hilo que realiza la exportación
+        System.out.println("Exportando CSV en: "
+                + Thread.currentThread().getName());
 
         try (BufferedWriter escritor = Files.newBufferedWriter(
                 destino.toPath(), StandardCharsets.UTF_8)) {
@@ -205,5 +338,7 @@ public class personaDAO {
                 escritor.newLine();
             }
         }
+
+        System.out.println("Exportación CSV finalizada.");
     }
 }

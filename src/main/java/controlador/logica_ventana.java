@@ -36,6 +36,10 @@ import javax.swing.ActionMap;
 import javax.swing.SwingWorker;
 import javax.swing.JProgressBar;
 import java.util.concurrent.ExecutionException;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.Locale;
+import javax.swing.SwingUtilities;
 
 public class logica_ventana implements ActionListener,
         ListSelectionListener {
@@ -54,6 +58,12 @@ public class logica_ventana implements ActionListener,
 
     // Ordenamiento y filtrado
     private TableRowSorter<DefaultTableModel> ordenador;
+
+    // Control de las búsquedas concurrentes
+    private SwingWorker<Set<Integer>, Void> busquedaActual;
+
+// Identificador de la última búsqueda solicitada
+    private long numeroBusqueda = 0;
 
     // Constructor del controlador
     public logica_ventana(ventana delegado) {
@@ -333,15 +343,25 @@ public class logica_ventana implements ActionListener,
                     List<persona> datosCargados = get();
 
                     // Quitar selección anterior
-                    delegado.getTblContactos().clearSelection();
+                    // Obtener la tabla
+                    JTable tabla = delegado.getTblContactos();
+
+                    // Cancelar búsquedas anteriores
+                    if (busquedaActual != null) {
+                        busquedaActual.cancel(true);
+                    }
+                    numeroBusqueda++;
+
+                    // Limpiar selección y desconectar el ordenador
+                    tabla.clearSelection();
+                    tabla.setRowSorter(null);
 
                     // Actualizar lista de contactos
                     contactos = datosCargados;
 
-                    // Limpiar la tabla
+                    // Reconstruir la tabla
                     modeloTabla.setRowCount(0);
 
-                    // Agregar contactos a la JTable
                     for (persona contacto : contactos) {
 
                         Object[] fila = {
@@ -355,8 +375,15 @@ public class logica_ventana implements ActionListener,
                         modeloTabla.addRow(fila);
                     }
 
+                    // Crear nuevamente el ordenador
+                    ordenador = new TableRowSorter<>(modeloTabla);
+                    tabla.setRowSorter(ordenador);
+
                     // Actualizar estadísticas
                     actualizarEstadisticas();
+
+                    // Aplicar nuevamente la búsqueda
+                    filtrarContactos();
 
                     // Carga completada
                     barra.setValue(100);
@@ -463,30 +490,93 @@ public class logica_ventana implements ActionListener,
     }
 
     // AGREGAR CONTACTO
+    // AGREGAR CONTACTO CON VALIDACIÓN EN SEGUNDO PLANO
     private void agregarContacto() {
 
+        // Obtener los datos del formulario
         persona contacto = obtenerContactoFormulario();
 
         if (contacto == null) {
             return;
         }
 
-        try {
-            dao.escribirArchivo(contacto);
+        // Evitar múltiples pulsaciones mientras se valida
+        delegado.getBtnAgregar().setEnabled(false);
 
-            cargarContactosRegistrados();
-            limpiarCampos();
+        // Crear un hilo secundario mediante SwingWorker
+        SwingWorker<Boolean, Void> trabajador
+                = new SwingWorker<Boolean, Void>() {
 
-            mostrarInformacion("mensaje.contacto.agregado");
+            @Override
+            protected Boolean doInBackground() throws Exception {
 
-        } catch (IOException ex) {
-            mostrarError(ex);
-        }
+                System.out.println("Validando contacto en: "
+                        + Thread.currentThread().getName());
+
+                // Notificar el inicio de la validación
+                notificarEstadoDesdeHilo("notificacion.validando");
+
+                // Validar duplicados y guardar el contacto
+                boolean guardado = dao.guardarSiNoExiste(contacto);
+
+                // Notificar el resultado de la operación
+                if (guardado) {
+                    notificarEstadoDesdeHilo("mensaje.contacto.agregado");
+                } else {
+                    notificarEstadoDesdeHilo("mensaje.contacto.duplicado");
+                }
+
+                return guardado;
+            }
+
+            @Override
+            protected void done() {
+
+                // La operación terminó: habilitar el botón
+                delegado.getBtnAgregar().setEnabled(true);
+
+                try {
+
+                    // Obtener el resultado del hilo secundario
+                    boolean guardado = get();
+
+                    if (guardado) {
+
+                        // Actualizar la interfaz gráfica
+                        limpiarCampos();
+                        cargarContactosRegistrados();
+
+                        mostrarInformacion("mensaje.contacto.agregado");
+
+                    } else {
+
+                        // Notificar que el contacto ya existe
+                        mostrarAviso("mensaje.contacto.duplicado");
+                    }
+
+                } catch (InterruptedException ex) {
+
+                    Thread.currentThread().interrupt();
+                    mostrarErrorConDetalle(
+                            "mensaje.error.almacenamiento", ex);
+
+                } catch (ExecutionException ex) {
+
+                    mostrarErrorConDetalle(
+                            "mensaje.error.almacenamiento",
+                            ex.getCause());
+                }
+            }
+        };
+
+        // Iniciar el hilo secundario
+        trabajador.execute();
     }
 
-    // MODIFICAR CONTACTO
+    // MODIFICAR CONTACTO EN SEGUNDO PLANO CON SINCRONIZACIÓN
     private void modificarContacto() {
 
+        // Obtener la fila seleccionada
         int fila = obtenerIndiceSeleccionado();
 
         if (fila == -1) {
@@ -494,33 +584,94 @@ public class logica_ventana implements ActionListener,
             return;
         }
 
-        persona contacto = obtenerContactoFormulario();
+        // Obtener los nuevos datos del formulario
+        persona contactoNuevo = obtenerContactoFormulario();
 
-        if (contacto == null) {
+        if (contactoNuevo == null) {
             return;
         }
 
-        List<persona> actualizados
-                = new ArrayList<>(contactos);
+        // Obtener los datos originales para detectar cambios
+        persona contactoOriginal = contactos.get(fila);
 
-        actualizados.set(fila, contacto);
+        // Evitar modificaciones repetidas durante el proceso
+        delegado.getBtnModificar().setEnabled(false);
 
-        try {
-            dao.actualizarContactos(actualizados);
+        // Crear trabajador en segundo plano
+        SwingWorker<Boolean, Void> trabajador
+                = new SwingWorker<Boolean, Void>() {
 
-            cargarContactosRegistrados();
-            limpiarCampos();
+            @Override
+            protected Boolean doInBackground() throws Exception {
 
-            mostrarInformacion("mensaje.contacto.modificado");
+                System.out.println("Modificando contacto en: "
+                        + Thread.currentThread().getName());
 
-        } catch (IOException ex) {
-            mostrarError(ex);
-        }
+                // Modificar mediante el método sincronizado del DAO
+                return dao.modificarContactoSeguro(
+                        fila,
+                        contactoOriginal,
+                        contactoNuevo
+                );
+            }
+
+            @Override
+            protected void done() {
+
+                // Habilitar nuevamente el botón
+                delegado.getBtnModificar().setEnabled(true);
+
+                try {
+
+                    // Obtener el resultado de la modificación
+                    boolean modificado = get();
+
+                    if (modificado) {
+
+                        // Actualizar los contactos
+                        limpiarCampos();
+                        cargarContactosRegistrados();
+
+                        // Mostrar mensaje de éxito
+                        mostrarInformacion("mensaje.contacto.modificado");
+
+                    } else {
+
+                        // Otro hilo pudo haber modificado el contacto
+                        cargarContactosRegistrados();
+
+                        mostrarAviso("mensaje.contacto.conflicto");
+                    }
+
+                } catch (InterruptedException ex) {
+
+                    Thread.currentThread().interrupt();
+
+                    mostrarErrorConDetalle(
+                            "mensaje.error.almacenamiento", ex);
+
+                } catch (ExecutionException ex) {
+
+                    mostrarErrorConDetalle(
+                            "mensaje.error.almacenamiento",
+                            ex.getCause());
+                }
+            }
+        };
+
+        // Iniciar la modificación en segundo plano
+        trabajador.execute();
     }
 
-    // ELIMINAR CONTACTO
+    // ELIMINAR CONTACTO EN SEGUNDO PLANO CON SINCRONIZACIÓN
     private void eliminarContacto() {
 
+        // Evitar operaciones mientras el botón esté deshabilitado
+        if (!delegado.getBtnEliminar().isEnabled()) {
+            return;
+        }
+
+        // Obtener la fila seleccionada
         int fila = obtenerIndiceSeleccionado();
 
         if (fila == -1) {
@@ -528,27 +679,81 @@ public class logica_ventana implements ActionListener,
             return;
         }
 
+        // Obtener el contacto original
+        persona contactoOriginal = contactos.get(fila);
+
+        // Confirmar la eliminación
         if (!confirmar("mensaje.contacto.confirmarEliminar",
                 "dialogo.confirmarEliminar")) {
             return;
         }
 
-        List<persona> actualizados
-                = new ArrayList<>(contactos);
+        // Evitar eliminaciones repetidas durante el proceso
+        delegado.getBtnEliminar().setEnabled(false);
 
-        actualizados.remove(fila);
+        // Crear trabajador en segundo plano
+        SwingWorker<Boolean, Void> trabajador
+                = new SwingWorker<Boolean, Void>() {
 
-        try {
-            dao.actualizarContactos(actualizados);
+            @Override
+            protected Boolean doInBackground() throws Exception {
 
-            cargarContactosRegistrados();
-            limpiarCampos();
+                System.out.println("Eliminando contacto en: "
+                        + Thread.currentThread().getName());
 
-            mostrarInformacion("mensaje.contacto.eliminado");
+                // Eliminar mediante el método sincronizado del DAO
+                return dao.eliminarContactoSeguro(
+                        fila,
+                        contactoOriginal
+                );
+            }
 
-        } catch (IOException ex) {
-            mostrarError(ex);
-        }
+            @Override
+            protected void done() {
+
+                // Habilitar nuevamente el botón
+                delegado.getBtnEliminar().setEnabled(true);
+
+                try {
+
+                    // Obtener el resultado de la eliminación
+                    boolean eliminado = get();
+
+                    if (eliminado) {
+
+                        // Limpiar formulario y actualizar tabla
+                        limpiarCampos();
+                        cargarContactosRegistrados();
+
+                        // Mostrar mensaje de éxito
+                        mostrarInformacion("mensaje.contacto.eliminado");
+
+                    } else {
+
+                        // El contacto pudo haber cambiado
+                        cargarContactosRegistrados();
+
+                        mostrarAviso("mensaje.contacto.conflicto");
+                    }
+
+                } catch (InterruptedException ex) {
+
+                    Thread.currentThread().interrupt();
+
+                    mostrarErrorConDetalle(
+                            "mensaje.error.almacenamiento", ex);
+
+                } catch (ExecutionException ex) {
+
+                    mostrarErrorConDetalle(
+                            "mensaje.error.almacenamiento",
+                            ex.getCause());
+                }
+            }
+        };
+
+        // Iniciar la eliminación en segundo plano
+        trabajador.execute();
     }
 
     // EXPORTAR CONTACTOS A CSV
@@ -603,10 +808,57 @@ public class logica_ventana implements ActionListener,
                     }
                 }
 
-                // Llamar al método del DAO
-                dao.exportarCSV(destino);
+                // Guardar la referencia al archivo seleccionado
+                final File archivoDestino = destino;
 
-                mostrarInformacion("mensaje.exportar.correcto");
+                // Crear el trabajador para exportar en segundo plano
+                SwingWorker<Void, Void> trabajador
+                        = new SwingWorker<Void, Void>() {
+
+                    @Override
+                    protected Void doInBackground() throws Exception {
+
+                        // Notificar el inicio de la exportación
+                        notificarEstadoDesdeHilo("notificacion.exportando");
+
+                        // Exportar contactos en segundo plano
+                        dao.exportarCSV(archivoDestino);
+
+                        // Notificar que la exportación finalizó
+                        notificarEstadoDesdeHilo("mensaje.exportar.correcto");
+
+                        return null;
+                    }
+
+                    @Override
+                    protected void done() {
+
+                        try {
+
+                            // Comprobar que la exportación terminó correctamente
+                            get();
+
+                            // Notificar al usuario en la interfaz gráfica
+                            mostrarInformacion("mensaje.exportar.correcto");
+
+                        } catch (InterruptedException ex) {
+
+                            Thread.currentThread().interrupt();
+
+                            mostrarErrorConDetalle(
+                                    "mensaje.error.almacenamiento", ex);
+
+                        } catch (ExecutionException ex) {
+
+                            mostrarErrorConDetalle(
+                                    "mensaje.error.almacenamiento",
+                                    ex.getCause());
+                        }
+                    }
+                };
+
+                // Iniciar la exportación en segundo plano
+                trabajador.execute();
 
             } catch (IOException ex) {
                 mostrarError(ex);
@@ -698,21 +950,104 @@ public class logica_ventana implements ActionListener,
     }
 
     // FILTRAR CONTACTOS POR NOMBRE
+    // FILTRAR CONTACTOS EN SEGUNDO PLANO
     private void filtrarContactos() {
 
+        // Obtener el texto introducido por el usuario
         String texto = delegado.getTxtBuscarContactos()
-                .getText().trim();
+                .getText().trim().toLowerCase(Locale.ROOT);
 
+        // Identificar esta nueva búsqueda
+        long solicitud = ++numeroBusqueda;
+
+        // Cancelar la búsqueda anterior si todavía está activa
+        if (busquedaActual != null) {
+            busquedaActual.cancel(true);
+        }
+
+        // Mostrar todos los contactos cuando el campo está vacío
         if (texto.isEmpty()) {
             ordenador.setRowFilter(null);
-        } else {
-            ordenador.setRowFilter(
-                    javax.swing.RowFilter.regexFilter(
-                            "(?i)" + Pattern.quote(texto),
-                            0
-                    )
-            );
+            return;
         }
+
+        // Tomar una copia de los contactos para el hilo
+        List<persona> listaOriginal = contactos;
+        List<persona> copiaContactos = new ArrayList<>(listaOriginal);
+
+        // Crear el trabajador de búsqueda
+        busquedaActual = new SwingWorker<Set<Integer>, Void>() {
+
+            @Override
+            protected Set<Integer> doInBackground() {
+
+                System.out.println("Buscando contactos en: "
+                        + Thread.currentThread().getName());
+
+                Set<Integer> coincidencias = new HashSet<>();
+
+                // Buscar coincidencias por nombre
+                for (int i = 0; i < copiaContactos.size(); i++) {
+
+                    if (isCancelled()) {
+                        return coincidencias;
+                    }
+
+                    String nombre = copiaContactos.get(i).getNombre();
+
+                    if (nombre != null
+                            && nombre.toLowerCase(Locale.ROOT)
+                                    .contains(texto)) {
+
+                        coincidencias.add(i);
+                    }
+                }
+
+                return coincidencias;
+            }
+
+            @Override
+            protected void done() {
+
+                // Ignorar resultados de búsquedas antiguas
+                if (isCancelled()
+                        || solicitud != numeroBusqueda
+                        || contactos != listaOriginal) {
+                    return;
+                }
+
+                try {
+
+                    // Obtener los índices encontrados
+                    Set<Integer> coincidencias = get();
+
+                    // Mostrar únicamente los contactos encontrados
+                    ordenador.setRowFilter(
+                            new javax.swing.RowFilter<DefaultTableModel, Integer>() {
+
+                        @Override
+                        public boolean include(
+                                Entry<? extends DefaultTableModel, ? extends Integer> fila) {
+
+                            return coincidencias.contains(
+                                    fila.getIdentifier());
+                        }
+                    });
+
+                } catch (InterruptedException ex) {
+
+                    Thread.currentThread().interrupt();
+
+                } catch (ExecutionException ex) {
+
+                    mostrarErrorConDetalle(
+                            "mensaje.error.cargar", ex.getCause());
+                }
+            }
+        };
+
+        // Ejecutar la búsqueda en segundo plano
+        busquedaActual.execute();
     }
 
     // ACTUALIZAR ESTADÍSTICAS
@@ -765,6 +1100,25 @@ public class logica_ventana implements ActionListener,
     private void mostrarInformacion(String clave) {
         mostrarDialogo(Idioma.obtener(clave), "dialogo.informacion",
                 JOptionPane.INFORMATION_MESSAGE);
+    }
+
+    // NOTIFICACIONES DESDE HILOS SECUNDARIOS
+    private void notificarEstadoDesdeHilo(String clave) {
+
+        // Solicitar una actualización segura de la interfaz
+        SwingUtilities.invokeLater(() -> {
+
+            // Obtener el mensaje en el idioma seleccionado
+            String mensaje = Idioma.obtener(clave);
+
+            // Actualizar el texto de estado de la aplicación
+            delegado.getPrgCarga().setString(mensaje);
+
+            // Comprobar en consola el hilo de la interfaz
+            System.out.println("Notificación mostrada en: "
+                    + Thread.currentThread().getName()
+                    + " - " + mensaje);
+        });
     }
 
     private void mostrarAviso(String clave) {
