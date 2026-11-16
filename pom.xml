@@ -13,7 +13,7 @@
     <version>1.0-SNAPSHOT</version>
     <packaging>jar</packaging>
 
-    <name>Tarea_2</name>
+    <name>Tarea_3</name>
 
     <!-- Configuración de Java -->
     <properties>
